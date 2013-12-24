@@ -23,6 +23,8 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.Iterables;
@@ -32,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.cql3.CFDefinition;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.Relation;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.LongType;
@@ -67,6 +70,7 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
     private static final Logger logger = LoggerFactory.getLogger(CqlPagingRecordReader.class);
 
     public static final int DEFAULT_CQL_PAGE_LIMIT = 1000; // TODO: find the number large enough but not OOM
+    private static final Pattern pattern = Pattern.compile(" ?\"?(\\w+)\"? ?([><=]).*"); //user defined where clauses
 
     private ColumnFamilySplit split;
     private RowIterator rowIterator;
@@ -421,7 +425,7 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
         /** compose the prepared query, pair.left is query id, pair.right is query */
         private Pair<Integer, String> composeQuery(String columns)
         {
-            Pair<Integer, String> clause = whereClause();
+            WhereClause clause = whereClause();
             if (columns == null)
             {
                 columns = "*";
@@ -438,12 +442,21 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
                         : partitionKey + "," + clusterKey + "," + columns;
             }
 
-            String whereStr = userDefinedWhereClauses == null ? "" : " AND " + userDefinedWhereClauses;
-            return Pair.create(clause.left,
-                               String.format("SELECT %s FROM %s%s%s LIMIT %d ALLOW FILTERING",
-                                             columns, quote(cfName), clause.right, whereStr, pageRowSize));
-        }
+            String whereStr;
+            if (userDefinedWhereClauses == null)
+                whereStr = "";
+            else if (clause.relations.size() == 0)
+                whereStr = String.format(" AND %s", userDefinedWhereClauses);
+            else
+            {
+                String filteredWC = filterWhereClause(userDefinedWhereClauses, clause.relations).left;
+                whereStr = filteredWC.equals("") ? "" : String.format(" AND %s", filteredWC);
+            }
 
+            return Pair.create(clause.queryId,
+                               String.format("SELECT %s FROM %s%s%s LIMIT %d ALLOW FILTERING",
+                                             columns, quote(cfName), clause.clause, whereStr, pageRowSize));
+        }
 
         /** remove key columns from the column string */
         private String withoutKeyColumns(String columnString)
@@ -467,7 +480,7 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
         }
 
         /** compose the where clause */
-        private Pair<Integer, String> whereClause()
+        private WhereClause whereClause()
         {
             if (partitionKeyString == null)
                 partitionKeyString = keyString(partitionBoundColumns);
@@ -476,28 +489,50 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
                 partitionKeyMarkers = partitionKeyMarkers();
             // initial query token(k) >= start_token and token(k) <= end_token
             if (emptyPartitionKeyValues())
-                return Pair.create(0, String.format(" WHERE token(%s) > ? AND token(%s) <= ?", partitionKeyString, partitionKeyString));
+                return new WhereClause(0, String.format(" WHERE token(%s) > ? AND token(%s) <= ?", partitionKeyString, partitionKeyString));
 
             // query token(k) > token(pre_partition_key) and token(k) <= end_token
             if (clusterColumns.size() == 0 || clusterColumns.get(0).value == null)
-                return Pair.create(1,
-                                   String.format(" WHERE token(%s) > token(%s)  AND token(%s) <= ?",
-                                                 partitionKeyString, partitionKeyMarkers, partitionKeyString));
+                return new WhereClause(1, String.format(" WHERE token(%s) > token(%s)  AND token(%s) <= ?", partitionKeyString, partitionKeyMarkers, partitionKeyString));
 
             // query token(k) = token(pre_partition_key) and m = pre_cluster_key_m and n > pre_cluster_key_n
-            Pair<Integer, String> clause = whereClause(clusterColumns, 0);
-            return Pair.create(clause.left,
-                               String.format(" WHERE token(%s) = token(%s) %s", partitionKeyString, partitionKeyMarkers, clause.right));
+            WhereClause clause = whereClause(clusterColumns);
+            Pair<String, Boolean> filteredWC = filterWhereClause(userDefinedWhereClauses, clause.relations);
+            if (filteredWC.right)
+            {
+                return new WhereClause(1, String.format(" WHERE token(%s) > token(%s)  AND token(%s) <= ?", partitionKeyString, partitionKeyMarkers, partitionKeyString));
+            }
+            else
+            {
+                clause.clause = String.format(" WHERE token(%s) = token(%s) %s", partitionKeyString, partitionKeyMarkers, clause.clause);
+                return clause;
+            }
         }
 
-        /** recursively compose the where clause */
-        private Pair<Integer, String> whereClause(List<BoundColumn> column, int position)
+        /** compose the where clause */
+        private WhereClause whereClause(List<BoundColumn> columns)
         {
-            if (position == column.size() - 1 || column.get(position + 1).value == null)
-                return Pair.create(position + 2, String.format(" AND %s %s ? ", quote(column.get(position).name), column.get(position).reversed ? " < " : " > "));
-
-            Pair<Integer, String> clause = whereClause(column, position + 1);
-            return Pair.create(clause.left, String.format(" AND %s = ? %s", quote(column.get(position).name), clause.right));
+            WhereClause clause = new WhereClause();
+            int i = 0;
+            StringBuilder sb = new StringBuilder();
+            for (BoundColumn column : columns)
+            {
+                if (i == columns.size() - 1 || columns.get(i + 1).value == null)
+                {
+                    clause.queryId = i + 2;
+                    sb.append(String.format(" AND %s %s ? ", quote(column.name), column.reversed ? " < " : " > "));
+                    clause.relations.put(column.name, column.reversed ? Relation.Type.LT : Relation.Type.GT);
+                    clause.clause = sb.toString();
+                    return clause;
+                }
+                else
+                {
+                    sb.append(String.format(" AND %s = ? ", quote(column.name)));
+                    clause.relations.put(column.name, Relation.Type.EQ);
+                }
+                i++;
+            }
+            return clause;
         }
 
         /** check whether all key values are null */
@@ -556,9 +591,20 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
                 }
                 else
                 {
-                    // query token(k) = token(pre_partition_key) and m = pre_cluster_key_m and n > pre_cluster_key_n
-                    int type = preparedQueryBindValues(clusterColumns, 0, values);
-                    return Pair.create(type, values);
+                    WhereClause clause = whereClause(clusterColumns);
+                    Pair<String, Boolean> filteredWC = filterWhereClause(userDefinedWhereClauses, clause.relations);
+                    if (filteredWC.right)
+                    {
+                        // query token(k) > token(pre_partition_key) and token(k) <= end_token
+                        values.add(partitioner.getTokenValidator().fromString(split.getEndToken()));
+                        return Pair.create(1, values);
+                    }
+                    else
+                    {
+                        // query token(k) = token(pre_partition_key) and m = pre_cluster_key_m and n > pre_cluster_key_n                        
+                        int type = preparedQueryBindValues(clusterColumns, 0, values);
+                        return Pair.create(type, values);
+                    }
                 }
             }
         }
@@ -588,9 +634,16 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
             Pair<Integer, String> query = null;
             query = composeQuery(columns);
             logger.debug("type: {}, query: {}", query.left, query.right);
-            CqlPreparedResult cqlPreparedResult = client.prepare_cql3_query(ByteBufferUtil.bytes(query.right), Compression.NONE);
-            preparedQueryIds.put(query.left, cqlPreparedResult.itemId);
-            return cqlPreparedResult.itemId;
+            try
+            {
+                CqlPreparedResult cqlPreparedResult = client.prepare_cql3_query(ByteBufferUtil.bytes(query.right), Compression.NONE);    
+                preparedQueryIds.put(query.left, cqlPreparedResult.itemId);
+                return cqlPreparedResult.itemId;
+            }
+            catch(InvalidRequestException e)
+            {
+                throw new RuntimeException(query.right, e);  
+            }
         }
 
         /** Quoting for working with uppercase */
@@ -812,5 +865,99 @@ public class CqlPagingRecordReader extends RecordReader<Map<String, ByteBuffer>,
         {
             throw new RuntimeException(e);
         }
+    }
+
+    public static class WhereClause
+    {
+        public int queryId;
+        public String clause;
+        //relations of paging where clauses
+        public LinkedHashMap<String, Relation.Type> relations = new LinkedHashMap<String, Relation.Type>();
+
+        public WhereClause()
+        {
+        }
+        public WhereClause(int queryId, String clause)
+        {
+            this.queryId = queryId;
+            this.clause = clause;
+        }
+    }
+
+    /*
+     * Resolve the conflicts between paging where clauses and user defined where clauses
+     * 1. cluster column cannot be restricted by more than one relation if it includes an Equal
+     * 2. cluster column has more than two GT or LT restrictions
+     * 
+     * Return Pair<left, right>, where left is the where clause string, right is boolean flag to use next row qury
+     */
+    public static Pair<String, Boolean> filterWhereClause(String userDefinedWC, LinkedHashMap<String, Relation.Type> pagingWCRelations)
+    {
+        if(userDefinedWC == null)
+            return Pair.create("", false);
+
+        String[] udClauses = userDefinedWC.split(" AND | and ");
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        List<String> eqColumns = new ArrayList<String>();
+        for (String udClause : udClauses)
+        {
+            // ?\"?(\\w+)\"? ?([>=<]).*
+            Matcher matcher = pattern.matcher(udClause);
+            if (matcher.find())
+            {
+                String column = matcher.group(1);
+                Relation.Type type = relationType(matcher.group(2));
+                Relation.Type pagingType = pagingWCRelations.get(column);
+                if (type == Relation.Type.EQ)
+                    eqColumns.add(column);
+                if (pagingType != null && (pagingType == type || pagingType == Relation.Type.EQ))
+                {
+                    continue;
+                }
+                else
+                {
+                    if (first)
+                        sb = new StringBuilder(udClause);
+                    else
+                        sb.append(" and " ).append(udClause);
+                }
+            }
+            else
+            {
+                if (first)
+                    sb = new StringBuilder(udClause);
+                else
+                    sb.append(" and " ).append(udClause);
+            }   
+        }
+        boolean gotoNextRow = true;
+        for(Map.Entry<String, Relation.Type> entry : pagingWCRelations.entrySet())
+        {
+            if (entry.getValue() != Relation.Type.EQ)
+            {
+                if (!eqColumns.contains(entry.getKey()))
+                    gotoNextRow = false;
+                break;
+            }
+            else if (!eqColumns.contains(entry.getKey()))
+            {
+                gotoNextRow = false;
+                break;
+            }
+        }
+        return Pair.create(sb.toString(), gotoNextRow);
+    }
+
+    private static Relation.Type relationType(String op)
+    {
+        if (op.equals(">"))
+            return Relation.Type.GT;
+        else if (op.equals("<"))
+            return Relation.Type.LT;
+        else if (op.equals("="))
+            return Relation.Type.EQ;
+        else
+            return null;
     }
 }
